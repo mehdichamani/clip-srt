@@ -34,7 +34,13 @@ try {
     }
 
     Write-Host "Activating virtual environment..."
-    .\$venvPath\Scripts\Activate.ps1
+    $activatePath = Join-Path $venvPath 'Scripts\Activate.ps1'
+    if (Test-Path $activatePath) {
+        # Dot-source the activation script: dot, space, then path
+        . $activatePath
+    } else {
+        Write-Warning "Activation script not found at $activatePath. You can activate manually: .\$venvPath\Scripts\Activate.ps1"
+    }
 
     Write-Host "Upgrading pip, setuptools and wheel..."
     python -m pip install --upgrade pip setuptools wheel
