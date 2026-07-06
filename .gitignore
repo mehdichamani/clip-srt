@@ -1,0 +1,6 @@
+.env
+whisper_model
+cache
+archive
+history.json
+service.log
