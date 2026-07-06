@@ -299,6 +299,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔗 کافیست لینک ویدیو یا کلیپ خود را برای من بفرستید تا آن را با زیرنویس فارسی (Softcode MKV) تحویلتان دهم."
     ))
 
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply with a short Persian guide describing available commands and limits."""
+    guide = (
+        "راهنما:\n\n"
+        "- ارسال لینک: یک لینک ویدیویی برای من بفرست؛ ربات ویدیو را دانلود، صوت را استخراج، متن را تشخیص و ترجمه می‌کنه و فیلم با زیرنویس رو برات میفرسته.\n\n"
+        "- فرمان‌ها: /start برای خوش‌آمدگویی، /help برای نمایش این راهنما.\n\n"
+        "- محدودیت‌ها: کلیپ های بالای یک گیگ رو نمیتونیم پردازش کنیم فعلا،  تعداد پردازش همزمان کلیپ ها محدودع، پس اگه طول میکشه یکم صبر کن.\n\n"
+        "- پشتیبانی: فعلا ربات در حال توسعه است پس اگ خطا داد واسم بفرستید به این آیدی @mehdi_chamani تا درستش کنم."
+    )
+
+    await safe_telegram_call(reply_text_factory(update.message, guide))
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received message: %s", update.message.text)
 
@@ -330,7 +343,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log_action("Telegram", user_info, "FAILED", url)
         logger.exception("Processing failed for %s", url)
-        await update.message.reply_text(f"❌ خطایی در طول فرآیند پردازش رخ داد: {str(e)}")
+        await safe_telegram_call(reply_text_factory(update.message, f"❌ خطایی در طول فرآیند پردازش رخ داد: {str(e)}"))
 
 def main():
     logger.info("🚀 Local pipeline bot testing script initialized...")
@@ -346,6 +359,7 @@ def main():
         )
 
         app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("help", help_command))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
         logger.info("🔋 Listening for message links incoming via Telegram...")
