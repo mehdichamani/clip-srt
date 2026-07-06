@@ -3,3 +3,4 @@ faster-whisper
 deep-translator
 yt-dlp
 python-dotenv
+portalocker

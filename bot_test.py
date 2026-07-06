@@ -4,7 +4,7 @@ import json
 import logging
 import asyncio
 import tempfile
-import fcntl
+import portalocker
 import threading
 from datetime import datetime
 from urllib.parse import urlparse
@@ -70,13 +70,17 @@ def load_history():
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
-                try:
-                    history = json.load(f)
-                except json.JSONDecodeError:
-                    history = {}
-                finally:
-                    fcntl.flock(f, fcntl.LOCK_UN)
+                    try:
+                        portalocker.lock(f, portalocker.LOCK_SH)
+                        try:
+                            history = json.load(f)
+                        except json.JSONDecodeError:
+                            history = {}
+                    finally:
+                        try:
+                            portalocker.unlock(f)
+                        except Exception:
+                            pass
         except Exception:
             logger.exception("Failed to load history file")
     return history
@@ -85,11 +89,16 @@ def save_history_atomic(history_obj):
     tmp_fd, tmp_path = tempfile.mkstemp(prefix="history_", dir=os.path.dirname(HISTORY_FILE) or ".")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            json.dump(history_obj, f, indent=4, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-            fcntl.flock(f, fcntl.LOCK_UN)
+            try:
+                portalocker.lock(f, portalocker.LOCK_EX)
+                json.dump(history_obj, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                try:
+                    portalocker.unlock(f)
+                except Exception:
+                    pass
         os.replace(tmp_path, HISTORY_FILE)
     except Exception:
         logger.exception("Failed to write history atomically")
