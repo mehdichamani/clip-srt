@@ -10,6 +10,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.error import NetworkError
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram.warnings import PTBUserWarning
 import warnings
@@ -114,6 +115,45 @@ def format_srt_time(seconds):
     secs = int(seconds % 60)
     milliseconds = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+
+
+async def safe_telegram_call(coro_factory, retries: int = 3, initial_backoff: float = 1.0):
+    """Run a coroutine factory that performs a Telegram API call with retries on NetworkError.
+
+    coro_factory should be a zero-arg callable that returns the coroutine to await.
+    This ensures resources like files are opened inside the attempt and not reused across retries.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            coro = coro_factory()
+            return await coro
+        except NetworkError as e:
+            logger.warning("Telegram network error (attempt %d/%d): %s", attempt, retries, e)
+            if attempt == retries:
+                logger.exception("Exceeded Telegram retry attempts")
+                raise
+            await asyncio.sleep(initial_backoff * (2 ** (attempt - 1)))
+
+
+def reply_text_factory(message_obj, text):
+    async def coro():
+        return await message_obj.reply_text(text)
+    return coro
+
+
+def reply_document_factory(message_obj, file_path, caption=None):
+    async def coro():
+        with open(file_path, 'rb') as f:
+            if caption:
+                return await message_obj.reply_document(document=f, caption=caption)
+            return await message_obj.reply_document(document=f)
+    return coro
+
+
+def edit_text_factory(message_obj, text):
+    async def coro():
+        return await message_obj.edit_text(text)
+    return coro
 
 _MODEL = None
 _TRANSLATOR = None
@@ -245,10 +285,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_info = f"@{user.username} (ID: {user.id})" if user.username else f"ID: {user.id}"
     log_action("Telegram", user_info, "COMMAND: /start", "N/A")
 
-    await update.message.reply_text(
+    await safe_telegram_call(reply_text_factory(update.message,
         "👋 سلام! به ربات مترجم ویدیو خوش آمدید.\n\n"
         "🔗 کافیست لینک ویدیو یا کلیپ خود را برای من بفرستید تا آن را با زیرنویس فارسی (Softcode MKV) تحویلتان دهم."
-    )
+    ))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Received message: %s", update.message.text)
@@ -267,19 +307,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cached_file = get_archived_file(url)
     if cached_file and os.path.exists(cached_file):
         log_action("Telegram", user_info, "CACHE_HIT", url, cached_file)
-        await update.message.reply_text("✨ این لینک قبلاً پردازش شده است! در حال ارسال فایل اصلی آرشیو...")
-        with open(cached_file, 'rb') as doc:
-            await update.message.reply_document(document=doc)
+        await safe_telegram_call(reply_text_factory(update.message, "✨ این لینک قبلاً پردازش شده است! در حال ارسال فایل اصلی آرشیو..."))
+        await safe_telegram_call(reply_document_factory(update.message, cached_file))
         return
 
-    status_msg = await update.message.reply_text("⏳ لینک شما به صف پردازش اضافه شد. در حال دانلود و آماده‌سازی زیرنویس فارسی...")
+    status_msg = await safe_telegram_call(reply_text_factory(update.message, "⏳ لینک شما به صف پردازش اضافه شد. در حال دانلود و آماده‌سازی زیرنویس فارسی..."))
 
     try:
         async with PROCESS_SEMAPHORE:
             output_mkv = await process_video(url, user_info)
-        await status_msg.edit_text("📤 فرآیند ترجمه به پایان رسید! در حال ارسال فایل ویدیو (Uncompressed MKV)...")
-        with open(output_mkv, 'rb') as doc:
-            await update.message.reply_document(document=doc)
+        await safe_telegram_call(edit_text_factory(status_msg, "📤 فرآیند ترجمه به پایان رسید! در حال ارسال فایل ویدیو (Uncompressed MKV)..."))
+        await safe_telegram_call(reply_document_factory(update.message, output_mkv))
     except Exception as e:
         log_action("Telegram", user_info, "FAILED", url)
         logger.exception("Processing failed for %s", url)
