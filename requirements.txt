@@ -2,3 +2,4 @@ python-telegram-bot==21.3
 faster-whisper
 deep-translator
 yt-dlp
+python-dotenv
