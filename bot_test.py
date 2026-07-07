@@ -6,6 +6,7 @@ import asyncio
 import tempfile
 import portalocker
 import threading
+import time
 from datetime import datetime
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -345,27 +346,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Processing failed for %s", url)
         await safe_telegram_call(reply_text_factory(update.message, f"❌ خطایی در طول فرآیند پردازش رخ داد: {str(e)}"))
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception: %s", context.error)
+
+
+MAX_RESTART_DELAY = 60
+
+
+def initialize_app():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .proxy(PROXY_URL)
+        .get_updates_proxy(PROXY_URL)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .connection_pool_size(1)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
+        .get_updates_pool_timeout(30)
+        .get_updates_connection_pool_size(1)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
+    return app
+
+
 def main():
     logger.info("🚀 Local pipeline bot testing script initialized...")
     logger.info("🌐 Proxy bridge: %s", PROXY_URL)
+    logger.info("🔋 Listening for message links incoming via Telegram...")
 
-    try:
-        app = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .proxy(PROXY_URL)
-            .get_updates_proxy(PROXY_URL)
-            .build()
-        )
+    delay = 1
+    while True:
+        try:
+            app = initialize_app()
+            app.run_polling()
+            delay = 1
+        except Exception:
+            logger.exception("Polling stopped unexpectedly, restarting in %ds...", delay)
+            time.sleep(delay)
+            delay = min(delay * 2, MAX_RESTART_DELAY)
 
-        app.add_handler(CommandHandler("start", start_command))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-        logger.info("🔋 Listening for message links incoming via Telegram...")
-        app.run_polling()
-    except Exception:
-        logger.exception("Failed to boot polling client")
 
 if __name__ == "__main__":
     main()
