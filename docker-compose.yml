@@ -1,0 +1,18 @@
+services:
+  clip-srt:
+    build: .
+    container_name: clip-srt
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./whisper_model:/app/whisper_model
+      - ./archive:/app/archive
+      - ./cache:/app/cache
+      - ./history.json:/app/history.json
+      - ./service.log:/app/service.log
+
+networks:
+  default:
+    name: vpn
+    external: true

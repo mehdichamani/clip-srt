@@ -363,7 +363,7 @@ def initialize_app():
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(30)
-        .connection_pool_size(1)
+        .connection_pool_size(8)
         .get_updates_connect_timeout(30)
         .get_updates_read_timeout(30)
         .get_updates_write_timeout(30)

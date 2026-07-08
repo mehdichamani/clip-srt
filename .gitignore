@@ -4,3 +4,4 @@ cache
 archive
 history.json
 service.log
+__pycache__
