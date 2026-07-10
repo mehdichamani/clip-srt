@@ -9,7 +9,6 @@ services:
       - ./whisper_model:/app/whisper_model
       - ./archive:/app/archive
       - ./cache:/app/cache
-      - ./history.json:/app/history.json
       - ./service.log:/app/service.log
 
 networks:
