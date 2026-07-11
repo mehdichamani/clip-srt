@@ -297,7 +297,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_telegram_call(reply_text_factory(update.message,
         "👋 سلام! به ربات مترجم ویدیو خوش آمدید.\n\n"
-        "🔗 کافیست لینک ویدیو یا کلیپ خود را برای من بفرستید تا آن را با زیرنویس فارسی (Softcode MKV) تحویلتان دهم."
+        "🔗 کافیست لینک ویدیو یا کلیپ خود را برای من بفرستید تا آن را با زیرنویس فارسی تحویلتان دهم.\n\n"
+        "❓ برای اطلاعات بیشتر /help را بزنید."
     ))
 
 
