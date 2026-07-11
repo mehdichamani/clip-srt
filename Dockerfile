@@ -15,5 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
 COPY bot_test.py .
+COPY download_model.py .
 
 CMD ["python", "-u", "bot_test.py"]

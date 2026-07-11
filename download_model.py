@@ -4,7 +4,7 @@ from faster_whisper import WhisperModel
 
 
 def download_local_model():
-    model_size = "base"  # You can change this to "tiny" or "small"
+    model_size = "medium"  # Upgraded from 'base' for better multilingual (Turkish, etc.) accuracy
     output_dir = os.getenv("MODEL_PATH", "./whisper_model")
 
     # Respect only HTTP/HTTPS proxies for the downloader. Ignore socks proxies (they may be unsupported).
