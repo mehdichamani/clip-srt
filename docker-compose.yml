@@ -6,6 +6,7 @@ services:
     env_file:
       - .env
     volumes:
+      - ./bot_test.py:/app/bot_test.py
       - ./whisper_model:/app/whisper_model
       - ./archive:/app/archive
       - ./cache:/app/cache
