@@ -237,7 +237,8 @@ async def prepare_video(url: str, user_info: str, status_callback=None) -> dict:
         await status_callback("📥 [مرحله ۱/۴] در حال دانلود ویدیو...")
 
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'bestvideo+bestaudio/best',
+        'merge_output_format': 'mp4',
         'outtmpl': video_path,
         'proxy': PROXY_URL,
         'noplaylist': True,
@@ -288,7 +289,10 @@ async def prepare_video(url: str, user_info: str, status_callback=None) -> dict:
     )
     _, stderr = await audio_proc.communicate()
     if audio_proc.returncode != 0 or not os.path.exists(audio_path):
-        logger.error("ffmpeg audio extraction failed: %s", stderr.decode(errors='ignore') if stderr else "")
+        stderr_str = stderr.decode(errors='ignore') if stderr else ""
+        logger.error("ffmpeg audio extraction failed: %s", stderr_str)
+        if "Output file does not contain any stream" in stderr_str:
+            raise RuntimeError("Video has no audio stream or audio could not be found.")
         raise FileNotFoundError(f"ffmpeg failed to extract audio: {audio_path}")
 
     # Step 3: Speech recognition
@@ -509,6 +513,12 @@ async def execute_pipeline(context: ContextTypes.DEFAULT_TYPE, chat_id: int, url
         log_action("Telegram", user_info, "FAILED", url)
         logger.exception("Pipeline execution failed for %s", url)
 
+        err_str = str(e)
+        if "has no audio stream" in err_str or "does not contain any stream" in err_str:
+            user_msg = "❌ این ویدیو فاقد ترک صوتی است (فایل ویدیو بی‌صدا است)، بنابراین امکان استخراج زیرنویس برای آن وجود ندارد."
+        else:
+            user_msg = f"❌ خطایی در طول فرآیند پردازش رخ داد:\n`{err_str}`\n\nمی‌توانید دوباره تلاش کنید:"
+
         # Store job for retry
         retry_job_id = str(uuid.uuid4())
         store_pending_job(context.application.bot_data, retry_job_id, {
@@ -524,7 +534,7 @@ async def execute_pipeline(context: ContextTypes.DEFAULT_TYPE, chat_id: int, url
 
         await safe_telegram_call(edit_text_factory(
             status_msg,
-            f"❌ خطایی در طول فرآیند پردازش رخ داد:\n`{str(e)}`\n\nمی‌توانید دوباره تلاش کنید:",
+            user_msg,
             reply_markup=retry_keyboard,
         ))
 
