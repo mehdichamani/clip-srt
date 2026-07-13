@@ -37,8 +37,6 @@ logger = logging.getLogger(__name__)
 
 # Network / proxy configuration (do not sweep environment variables)
 PROXY_URL = os.getenv("PROXY_URL", "")
-# Only export HTTP proxy env vars if the provided PROXY_URL is an HTTP(S) proxy.
-# Avoid exporting socks proxies into HTTP_PROXY/HTTPS_PROXY which some libs may not accept.
 if PROXY_URL and PROXY_URL.startswith(("http://", "https://")):
     os.environ.setdefault("HTTP_PROXY", PROXY_URL)
     os.environ.setdefault("HTTPS_PROXY", PROXY_URL)
@@ -82,17 +80,17 @@ def load_history():
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                try:
+                    portalocker.lock(f, portalocker.LOCK_SH)
                     try:
-                        portalocker.lock(f, portalocker.LOCK_SH)
-                        try:
-                            history = json.load(f)
-                        except json.JSONDecodeError:
-                            history = {}
-                    finally:
-                        try:
-                            portalocker.unlock(f)
-                        except Exception:
-                            pass
+                        history = json.load(f)
+                    except json.JSONDecodeError:
+                        history = {}
+                finally:
+                    try:
+                        portalocker.unlock(f)
+                    except Exception:
+                        pass
         except Exception:
             logger.exception("Failed to load history file")
     return history
@@ -139,11 +137,7 @@ def format_srt_time(seconds):
 
 
 async def safe_telegram_call(coro_factory, retries: int = 3, initial_backoff: float = 1.0):
-    """Run a coroutine factory that performs a Telegram API call with retries on NetworkError.
-
-    coro_factory should be a zero-arg callable that returns the coroutine to await.
-    This ensures resources like files are opened inside the attempt and not reused across retries.
-    """
+    """Run a coroutine factory that performs a Telegram API call with retries on NetworkError."""
     for attempt in range(1, retries + 1):
         try:
             coro = coro_factory()
@@ -154,6 +148,11 @@ async def safe_telegram_call(coro_factory, retries: int = 3, initial_backoff: fl
                 logger.exception("Exceeded Telegram retry attempts")
                 raise
             await asyncio.sleep(initial_backoff * (2 ** (attempt - 1)))
+        except Exception as e:
+            # Avoid crashing if edit_text fails due to unchanged content
+            if "Message is not modified" in str(e):
+                return None
+            raise
 
 
 def reply_text_factory(message_obj, text):
@@ -171,9 +170,9 @@ def reply_document_factory(message_obj, file_path, caption=None):
     return coro
 
 
-def edit_text_factory(message_obj, text):
+def edit_text_factory(message_obj, text, reply_markup=None):
     async def coro():
-        return await message_obj.edit_text(text)
+        return await message_obj.edit_text(text, reply_markup=reply_markup)
     return coro
 
 
@@ -191,12 +190,9 @@ PROCESS_SEMAPHORE = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "2")))
 def get_model():
     global _MODEL
     if _MODEL is None:
-        # Ensure model directory contains something — do not attempt network download.
         if not os.path.exists(MODEL_PATH) or not any(os.scandir(MODEL_PATH)):
             raise RuntimeError(f"No local model data found in {MODEL_PATH}. Run `python download_model.py` to download the model files before starting the bot.")
 
-        # Temporarily clear proxy env vars to avoid faster-whisper / hf hub trying to use network
-        # (and accidentally using non-http proxies such as socks:// which may be rejected).
         proxy_keys = [k for k in list(os.environ.keys()) if 'proxy' in k.lower()]
         saved_proxy = {k: os.environ.pop(k) for k in proxy_keys if k in os.environ}
         try:
@@ -205,7 +201,6 @@ def get_model():
             logger.exception("Failed to initialize WhisperModel: %s", e)
             raise RuntimeError(f"Failed to initialize WhisperModel: {e}\nEnsure model files are present in {MODEL_PATH} and that no network downloads are required.") from e
         finally:
-            # Restore proxy environment
             for k, v in saved_proxy.items():
                 os.environ[k] = v
     return _MODEL
@@ -222,45 +217,41 @@ def get_translator():
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: download, extract audio, transcribe, translate → return raw data
+# Phase 1: download, extract audio, transcribe, translate → step updates
 # ---------------------------------------------------------------------------
 
-async def prepare_video(url: str, user_info: str) -> dict:
+async def prepare_video(url: str, user_info: str, status_callback=None) -> dict:
     """Download video, transcribe and translate audio.
 
-    Returns a dict with keys:
-        video_path  – path to downloaded MP4
-        srt_path    – path to generated SRT file
-        segments    – list of dicts {original, translated, start, end}
-    The caller is responsible for either muxing or discarding video_path.
+    Notifies progress step-by-step via status_callback if provided.
+    Returns a dict with keys: video_path, srt_path, segments
     """
     base_name = f"video_{int(datetime.now().timestamp())}"
     video_path = os.path.join(CACHE_DIR, f"{base_name}.mp4")
     audio_path = os.path.join(CACHE_DIR, f"{base_name}.wav")
     srt_path = os.path.join(CACHE_DIR, f"{base_name}.srt")
 
-    # 1. Download video with reasonable constraints
+    # Step 1: Download video
     log_action("Telegram", user_info, "DOWNLOADING", url)
+    if status_callback:
+        await status_callback("📥 [مرحله ۱/۴] در حال دانلود ویدیو...")
+
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': video_path,
         'proxy': PROXY_URL,
         'noplaylist': True,
         'quiet': True,
-        # conservative max size (1 GiB)
         'max_filesize': 1073741824,
         'no_warnings': True,
-        # inner yt-dlp retries for HTTP-level errors
         'retries': 5,
         'socket_timeout': 30,
     }
 
-    # Outer retry loop: handles full network drops that kill yt-dlp mid-download
     DOWNLOAD_RETRIES = 3
-    DOWNLOAD_BACKOFF = 5  # seconds between attempts
+    DOWNLOAD_BACKOFF = 5
     last_download_exc: Exception | None = None
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
-        # Remove any partial file left from a previous failed attempt
         for leftover in [video_path, video_path + '.part']:
             try:
                 if os.path.exists(leftover):
@@ -270,7 +261,7 @@ async def prepare_video(url: str, user_info: str) -> dict:
         try:
             await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
             last_download_exc = None
-            break  # success
+            break
         except Exception as exc:
             last_download_exc = exc
             logger.warning(
@@ -286,8 +277,11 @@ async def prepare_video(url: str, user_info: str) -> dict:
             f"Last error: {last_download_exc}"
         )
 
-    # 2. Extract 16 kHz mono audio via ffmpeg (safer exec)
+    # Step 2: Extract audio
     log_action("Telegram", user_info, "EXTRACTING AUDIO", url)
+    if status_callback:
+        await status_callback("🎙️ [مرحله ۲/۴] در حال استخراج فایل صوتی...")
+
     audio_proc = await asyncio.create_subprocess_exec(
         'ffmpeg', '-y', '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', audio_path,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
@@ -297,16 +291,22 @@ async def prepare_video(url: str, user_info: str) -> dict:
         logger.error("ffmpeg audio extraction failed: %s", stderr.decode(errors='ignore') if stderr else "")
         raise FileNotFoundError(f"ffmpeg failed to extract audio: {audio_path}")
 
-    # 3. Speech recognition with local Whisper model (singleton)
+    # Step 3: Speech recognition
     log_action("Telegram", user_info, "TRANSCRIBING", url)
+    if status_callback:
+        await status_callback("🤖 [مرحله ۳/۴] در حال تبدیل گفتار به متن (Whisper)...")
+
     model = get_model()
     if model is None:
         raise RuntimeError("Whisper model not available")
     raw_segments, _ = await asyncio.to_thread(model.transcribe, audio_path, beam_size=5)
     raw_segments = list(raw_segments)
 
-    # 4. Translate segments to Persian online (translator singleton)
+    # Step 4: Translate segments to Persian
     log_action("Telegram", user_info, "TRANSLATING", url)
+    if status_callback:
+        await status_callback("🔤 [مرحله ۴/۴] در حال ترجمه زیرنویس به فارسی...")
+
     translator = get_translator()
     if translator is None:
         raise RuntimeError("Translator not available")
@@ -329,7 +329,7 @@ async def prepare_video(url: str, user_info: str) -> dict:
                 "end": seg.end,
             })
 
-    # Remove intermediate audio file — no longer needed
+    # Cleanup intermediate audio
     try:
         if os.path.exists(audio_path):
             os.remove(audio_path)
@@ -362,7 +362,6 @@ async def mux_clip(video_path: str, srt_path: str, url: str, user_info: str) -> 
         logger.error("ffmpeg muxing failed: %s", stderr.decode(errors='ignore') if stderr else "")
         raise RuntimeError("Muxing failed")
 
-    # Clean up source files
     for path in [video_path, srt_path]:
         try:
             if os.path.exists(path):
@@ -376,18 +375,17 @@ async def mux_clip(video_path: str, srt_path: str, url: str, user_info: str) -> 
 
 
 # ---------------------------------------------------------------------------
-# Phase 2b: build dual-language text output, skip mux entirely
+# Phase 2b: build dual-language text output
 # ---------------------------------------------------------------------------
 
 def build_dual_text(segments: list) -> list[str]:
-    """Build dual-language (original + Persian) text messages split to fit Telegram limits."""
+    """Build dual-language text messages split to fit Telegram limits."""
     lines = []
     for seg in segments:
         lines.append(seg["original"])
         lines.append(seg["translated"])
-        lines.append("")  # blank separator between pairs
+        lines.append("")
 
-    # Split into chunks that fit within Telegram's character limit
     chunks: list[str] = []
     current_chunk = ""
     for line in lines:
@@ -403,7 +401,7 @@ def build_dual_text(segments: list) -> list[str]:
 
 
 def cleanup_prepare_files(video_path: str, srt_path: str):
-    """Remove temporary files when the user chose text-only output."""
+    """Remove temporary files when text-only mode is selected."""
     for path in [video_path, srt_path]:
         try:
             if os.path.exists(path):
@@ -413,18 +411,16 @@ def cleanup_prepare_files(video_path: str, srt_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Pending job store: maps job_id → job payload stored in bot_data
+# Pending job store
 # ---------------------------------------------------------------------------
 
 PENDING_JOBS_KEY = "pending_jobs"
-
 
 def store_pending_job(bot_data: dict, job_id: str, payload: dict):
     if PENDING_JOBS_KEY not in bot_data:
         bot_data[PENDING_JOBS_KEY] = {}
     bot_data[PENDING_JOBS_KEY][job_id] = payload
     logger.info("Stored pending job %s", job_id)
-
 
 def pop_pending_job(bot_data: dict, job_id: str) -> dict | None:
     jobs = bot_data.get(PENDING_JOBS_KEY, {})
@@ -435,7 +431,106 @@ def pop_pending_job(bot_data: dict, job_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Telegram command handlers
+# Central Pipeline Executor & Failure Handling
+# ---------------------------------------------------------------------------
+
+async def execute_pipeline(context: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str, user_info: str, status_msg, target_output: str | None = None):
+    """Execute download, transcription, translation and delivery. Handles errors with a Retry prompt."""
+
+    async def update_status(text: str):
+        await safe_telegram_call(edit_text_factory(status_msg, text))
+
+    try:
+        await update_status("⏳ درخواست شما در صف پردازش قرار گرفت...")
+        async with PROCESS_SEMAPHORE:
+            prepared = await prepare_video(url, user_info, status_callback=update_status)
+
+        # If a specific target output format was pre-selected (e.g. from cached choice or retry)
+        if target_output == "clip":
+            await update_status("⏳ در حال میکس زیرنویس با ویدیو...")
+            final_mkv = await mux_clip(prepared["video_path"], prepared["srt_path"], url, user_info)
+            await update_status("📤 آماده شد! در حال ارسال فایل ویدیو (MKV)...")
+
+            async def send_clip():
+                with open(final_mkv, 'rb') as f:
+                    return await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption="🎬 کلیپ با زیرنویس فارسی",
+                    )
+            await safe_telegram_call(send_clip)
+            await update_status("✅ ویدیو با زیرنویس فارسی ارسال شد.")
+            log_action("Telegram", user_info, "DELIVERED (CLIP)", url, final_mkv)
+
+        elif target_output == "text":
+            log_action("Telegram", user_info, "DELIVERING TEXT", url)
+            cleanup_prepare_files(prepared["video_path"], prepared["srt_path"])
+            chunks = build_dual_text(prepared["segments"])
+            if not chunks:
+                await update_status("⚠️ متنی برای ارسال وجود ندارد.")
+                return
+
+            await update_status(f"📝 در حال ارسال متن دوزبانه ({len(chunks)} بخش)...")
+            for idx, chunk in enumerate(chunks, start=1):
+                async def send_chunk(c=chunk):
+                    return await context.bot.send_message(chat_id=chat_id, text=c)
+                await safe_telegram_call(send_chunk)
+                if idx < len(chunks):
+                    await asyncio.sleep(0.5)
+
+            await update_status(f"✅ متن دوزبانه ارسال شد ({len(chunks)} بخش).")
+            log_action("Telegram", user_info, "DELIVERED (TEXT)", url)
+
+        else:
+            # Prompt user to select output format
+            job_id = str(uuid.uuid4())
+            store_pending_job(context.application.bot_data, job_id, {
+                "url": url,
+                "user_info": user_info,
+                "video_path": prepared["video_path"],
+                "srt_path": prepared["srt_path"],
+                "segments": prepared["segments"],
+                "chat_id": chat_id,
+            })
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📹 کلیپ با زیرنویس", callback_data=f"clip:{job_id}"),
+                    InlineKeyboardButton("📝 فقط متن دوزبانه", callback_data=f"text:{job_id}"),
+                ]
+            ])
+            await safe_telegram_call(edit_text_factory(
+                status_msg,
+                "✅ پردازش و ترجمه کامل شد! خروجی مورد نظرتان را انتخاب کنید:",
+                reply_markup=keyboard,
+            ))
+
+    except Exception as e:
+        log_action("Telegram", user_info, "FAILED", url)
+        logger.exception("Pipeline execution failed for %s", url)
+
+        # Store job for retry
+        retry_job_id = str(uuid.uuid4())
+        store_pending_job(context.application.bot_data, retry_job_id, {
+            "url": url,
+            "user_info": user_info,
+            "chat_id": chat_id,
+            "target_output": target_output,
+        })
+
+        retry_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 تلاش مجدد", callback_data=f"retry:{retry_job_id}")]
+        ])
+
+        await safe_telegram_call(edit_text_factory(
+            status_msg,
+            f"❌ خطایی در طول فرآیند پردازش رخ داد:\n`{str(e)}`\n\nمی‌توانید دوباره تلاش کنید:",
+            reply_markup=retry_keyboard,
+        ))
+
+
+# ---------------------------------------------------------------------------
+# Telegram Commands and Message Handlers
 # ---------------------------------------------------------------------------
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,18 +546,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reply with a short Persian guide describing available commands and limits."""
     guide = (
         "راهنما:\n\n"
-        "- ارسال لینک: یک لینک ویدیویی برای من بفرست؛ ربات ویدیو را دانلود، صوت را استخراج، متن را تشخیص و ترجمه می‌کنه.\n\n"
-        "- بعد از پردازش از شما می‌پرسد خروجی چطور باشد:\n"
+        "- ارسال لینک: یک لینک ویدیویی بفرستید. ربات در ۴ مرحله (دانلود، استخراج صوت، Whisper، ترجمه) آن را پردازش می‌کند.\n\n"
+        "- انتخابی بودن خروجی:\n"
         "  📹 کلیپ با زیرنویس فارسی\n"
-        "  📝 فقط متن دوزبانه (سریع‌تر، بدون آپلود ویدیو)\n\n"
-        "- فرمان‌ها: /start برای خوش‌آمدگویی، /help برای نمایش این راهنما.\n\n"
-        "- محدودیت‌ها: کلیپ های بالای یک گیگ رو نمیتونیم پردازش کنیم فعلا، تعداد پردازش همزمان کلیپ ها محدودع، پس اگه طول میکشه یکم صبر کن.\n\n"
-        "- پشتیبانی: فعلا ربات در حال توسعه است پس اگ خطا داد واسم بفرستید به این آیدی @mehdi_chamani تا درستش کنم."
+        "  📝 فقط متن دوزبانه خط به خط\n\n"
+        "- لینک‌های آرشیو شده: اگر لینکی قبلاً پردازش شده باشد، می‌توانید فایل آرشیو شده را دریافت کنید یا دوباره با الگوریتم جدید پردازش کنید.\n\n"
+        "- در صورت بروز خطا: دکمه 🔁 تلاش مجدد در اختیار شما قرار می‌گیرد.\n\n"
+        "- پشتیبانی: @mehdi_chamani"
     )
-
     await safe_telegram_call(reply_text_factory(update.message, guide))
 
 
@@ -477,102 +570,109 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.message.from_user
     user_info = f"@{user.username} (ID: {user.id})" if user.username else f"ID: {user.id}"
+    chat_id = update.effective_chat.id
 
     log_action("Telegram", user_info, "RECEIVED", url)
 
+    # Check for cache hit
     cached_file = get_archived_file(url)
     if cached_file and os.path.exists(cached_file):
-        log_action("Telegram", user_info, "CACHE_HIT", url, cached_file)
-        await safe_telegram_call(reply_text_factory(update.message, "✨ این لینک قبلاً پردازش شده است! در حال ارسال فایل اصلی آرشیو..."))
-        await safe_telegram_call(reply_document_factory(update.message, cached_file))
-        return
-
-    status_msg = await safe_telegram_call(
-        reply_text_factory(update.message, "⏳ لینک شما به صف پردازش اضافه شد. در حال دانلود، تشخیص گفتار و ترجمه...")
-    )
-
-    try:
-        async with PROCESS_SEMAPHORE:
-            prepared = await prepare_video(url, user_info)
-
-        # Ask user what kind of output they want
+        log_action("Telegram", user_info, "CACHE_HIT_PROMPT", url, cached_file)
         job_id = str(uuid.uuid4())
         store_pending_job(context.application.bot_data, job_id, {
             "url": url,
             "user_info": user_info,
-            "video_path": prepared["video_path"],
-            "srt_path": prepared["srt_path"],
-            "segments": prepared["segments"],
-            "original_message_id": update.message.message_id,
-            "chat_id": update.effective_chat.id,
+            "cached_file": cached_file,
+            "chat_id": chat_id,
         })
 
         keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📦 دریافت نسخه آرشیو شده (قبلی)", callback_data=f"cache_send:{job_id}")],
             [
-                InlineKeyboardButton("📹 کلیپ با زیرنویس", callback_data=f"clip:{job_id}"),
-                InlineKeyboardButton("📝 فقط متن دوزبانه", callback_data=f"text:{job_id}"),
+                InlineKeyboardButton("📹 پردازش مجدد (کلیپ)", callback_data=f"reprocess_clip:{job_id}"),
+                InlineKeyboardButton("📝 پردازش مجدد (متن)", callback_data=f"reprocess_text:{job_id}"),
             ]
         ])
 
-        await safe_telegram_call(edit_text_factory(
-            status_msg,
-            "✅ پردازش کامل شد! خروجی مورد نظرتان را انتخاب کنید:"
-        ))
         await safe_telegram_call(reply_markup_factory(
             update.message,
-            "🎯 چه نوع خروجی می‌خواهید؟",
+            "✨ این لینک قبلاً پردازش شده است! چه تصمیمی دارید؟",
             keyboard,
         ))
+        return
 
-    except Exception as e:
-        log_action("Telegram", user_info, "FAILED", url)
-        logger.exception("Processing failed for %s", url)
-        await safe_telegram_call(
-            reply_text_factory(update.message, f"❌ خطایی در طول فرآیند پردازش رخ داد: {str(e)}")
-        )
+    status_msg = await safe_telegram_call(
+        reply_text_factory(update.message, "⏳ در حال افزودن به صف پردازش...")
+    )
+    await execute_pipeline(context, chat_id, url, user_info, status_msg)
 
 
 # ---------------------------------------------------------------------------
-# Callback handler for output-type selection
+# Callback Handlers
 # ---------------------------------------------------------------------------
 
 async def handle_output_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # acknowledge the button tap immediately
+    await query.answer()
 
     data = query.data or ""
     if ":" not in data:
         logger.warning("Unexpected callback data: %s", data)
         return
 
-    choice, job_id = data.split(":", 1)
+    action, job_id = data.split(":", 1)
     job = pop_pending_job(context.application.bot_data, job_id)
 
     if job is None:
-        logger.warning("Callback for unknown/expired job_id=%s choice=%s", job_id, choice)
+        logger.warning("Callback for unknown/expired job_id=%s action=%s", job_id, action)
         await query.edit_message_text("⚠️ این درخواست منقضی شده یا قبلاً پردازش شده است.")
         return
 
-    url = job["url"]
-    user_info = job["user_info"]
-    video_path = job["video_path"]
-    srt_path = job["srt_path"]
-    segments = job["segments"]
+    url = job.get("url")
+    user_info = job.get("user_info")
+    chat_id = job.get("chat_id")
 
-    logger.info("User %s chose output type '%s' for job %s", user_info, choice, job_id)
+    # Handle Cache choices
+    if action == "cache_send":
+        cached_file = job["cached_file"]
+        log_action("Telegram", user_info, "CACHE_SEND", url, cached_file)
+        await query.edit_message_text("✨ در حال ارسال فایل اصلی آرشیو...")
+        async def send_cached():
+            with open(cached_file, 'rb') as f:
+                return await context.bot.send_document(chat_id=chat_id, document=f)
+        await safe_telegram_call(send_cached)
+        await query.edit_message_text("✅ فایل آرشیو شده ارسال شد.")
+        return
 
-    if choice == "clip":
-        # --- Clip with subtitles ---
+    elif action in ("reprocess_clip", "reprocess_text"):
+        target = "clip" if action == "reprocess_clip" else "text"
+        log_action("Telegram", user_info, f"REPROCESS_{target.upper()}", url)
+        status_msg = query.message
+        await execute_pipeline(context, chat_id, url, user_info, status_msg, target_output=target)
+        return
+
+    elif action == "retry":
+        target_output = job.get("target_output")
+        log_action("Telegram", user_info, "RETRY_REQUESTED", url)
+        status_msg = query.message
+        await execute_pipeline(context, chat_id, url, user_info, status_msg, target_output=target_output)
+        return
+
+    # Handle initial choices post-processing
+    video_path = job.get("video_path")
+    srt_path = job.get("srt_path")
+    segments = job.get("segments")
+
+    if action == "clip":
         await query.edit_message_text("⏳ در حال میکس زیرنویس با ویدیو، لطفاً صبر کنید...")
         try:
             final_mkv = await mux_clip(video_path, srt_path, url, user_info)
             await query.edit_message_text("📤 آماده شد! در حال ارسال فایل ویدیو (MKV)...")
 
-            # Send the video file; reply to the original message for context
             async def send_clip():
                 with open(final_mkv, 'rb') as f:
                     return await context.bot.send_document(
-                        chat_id=job["chat_id"],
+                        chat_id=chat_id,
                         document=f,
                         caption="🎬 کلیپ با زیرنویس فارسی",
                     )
@@ -582,12 +682,25 @@ async def handle_output_choice(update: Update, context: ContextTypes.DEFAULT_TYP
 
         except Exception as e:
             logger.exception("Muxing/delivery failed for job %s", job_id)
-            # Cleanup on failure
             cleanup_prepare_files(video_path, srt_path)
-            await query.edit_message_text(f"❌ خطا در ساخت کلیپ: {str(e)}")
+            
+            # Offer retry option
+            retry_job_id = str(uuid.uuid4())
+            store_pending_job(context.application.bot_data, retry_job_id, {
+                "url": url,
+                "user_info": user_info,
+                "chat_id": chat_id,
+                "target_output": "clip",
+            })
+            retry_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔁 تلاش مجدد", callback_data=f"retry:{retry_job_id}")]
+            ])
+            await query.edit_message_text(
+                f"❌ خطا در ساخت کلیپ: {str(e)}",
+                reply_markup=retry_keyboard,
+            )
 
-    elif choice == "text":
-        # --- Dual-language text only, no mux ---
+    elif action == "text":
         log_action("Telegram", user_info, "DELIVERING TEXT", url)
         cleanup_prepare_files(video_path, srt_path)
 
@@ -597,15 +710,10 @@ async def handle_output_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         await query.edit_message_text(f"📝 در حال ارسال متن دوزبانه ({len(chunks)} بخش)...")
-
         for idx, chunk in enumerate(chunks, start=1):
             async def send_chunk(c=chunk):
-                return await context.bot.send_message(
-                    chat_id=job["chat_id"],
-                    text=c,
-                )
+                return await context.bot.send_message(chat_id=chat_id, text=c)
             await safe_telegram_call(send_chunk)
-            # Small delay to avoid hitting rate limits when many chunks
             if idx < len(chunks):
                 await asyncio.sleep(0.5)
 
@@ -613,8 +721,9 @@ async def handle_output_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         log_action("Telegram", user_info, "DELIVERED (TEXT)", url)
 
     else:
-        logger.warning("Unknown choice '%s' for job %s", choice, job_id)
-        cleanup_prepare_files(video_path, srt_path)
+        logger.warning("Unknown choice '%s' for job %s", action, job_id)
+        if video_path and srt_path:
+            cleanup_prepare_files(video_path, srt_path)
         await query.edit_message_text("⚠️ گزینه نامعتبر.")
 
 
@@ -623,7 +732,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 MAX_RESTART_DELAY = 60
-
 
 def initialize_app():
     app = (
