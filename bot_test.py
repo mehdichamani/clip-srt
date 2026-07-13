@@ -250,16 +250,41 @@ async def prepare_video(url: str, user_info: str) -> dict:
         # conservative max size (1 GiB)
         'max_filesize': 1073741824,
         'no_warnings': True,
+        # inner yt-dlp retries for HTTP-level errors
+        'retries': 5,
+        'socket_timeout': 30,
     }
 
-    # Run blocking yt-dlp download in thread pool
-    try:
-        await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
-    except Exception:
-        logger.exception("yt-dlp failed to download")
+    # Outer retry loop: handles full network drops that kill yt-dlp mid-download
+    DOWNLOAD_RETRIES = 3
+    DOWNLOAD_BACKOFF = 5  # seconds between attempts
+    last_download_exc: Exception | None = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        # Remove any partial file left from a previous failed attempt
+        for leftover in [video_path, video_path + '.part']:
+            try:
+                if os.path.exists(leftover):
+                    os.remove(leftover)
+            except Exception:
+                pass
+        try:
+            await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
+            last_download_exc = None
+            break  # success
+        except Exception as exc:
+            last_download_exc = exc
+            logger.warning(
+                "yt-dlp download attempt %d/%d failed: %s",
+                attempt, DOWNLOAD_RETRIES, exc,
+            )
+            if attempt < DOWNLOAD_RETRIES:
+                await asyncio.sleep(DOWNLOAD_BACKOFF * attempt)
 
     if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video downloaded but not found at expected path: {video_path}")
+        raise FileNotFoundError(
+            f"Video download failed after {DOWNLOAD_RETRIES} attempts. "
+            f"Last error: {last_download_exc}"
+        )
 
     # 2. Extract 16 kHz mono audio via ffmpeg (safer exec)
     log_action("Telegram", user_info, "EXTRACTING AUDIO", url)
